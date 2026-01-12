@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>无人机飞行规划 (终极修复版)</title>
+    
+    <script>
+        window.CESIUM_BASE_URL = "https://cdnjs.cloudflare.com/ajax/libs/cesium/1.107.0/";
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.107.0/Cesium.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.107.0/Widgets/widgets.min.css" rel="stylesheet">
+    
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: monospace; background-color: #000; }
+        
+        #cesiumContainer { width: 100%; height: 100%; background: #000; }
+
+        /* UI 控制面板 */
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px; width: 320px;
+            background: rgba(0, 0, 0, 0.9); 
+            padding: 15px; border: 1px solid #333;
+            z-index: 1000; color: #eee; 
+            font-family: 'Consolas', 'Monaco', monospace;
+            box-shadow: 0 0 15px rgba(0, 255, 0, 0.1);
+        }
+
+        h1 { margin: 0 0 10px 0; font-size: 14px; color: #0f0; text-transform: uppercase; border-bottom: 1px solid #333; padding-bottom: 5px; }
+
+        .btn {
+            display: block; width: 100%; box-sizing: border-box;
+            padding: 8px; margin-bottom: 5px; background: #111;
+            border: 1px solid #444; color: #fff; cursor: pointer; 
+            font-size: 12px; text-align: left;
+            transition: all 0.1s;
+        }
+        .btn:hover { background: #222; border-color: #0f0; color: #0f0; }
+
+        .stats-box {
+            background: #000; padding: 8px; border: 1px solid #333;
+            font-size: 10px; color: #0f0; margin-top: 10px; line-height: 1.4;
+        }
+        .highlight { color: #fff; font-weight: bold; }
+        .red-text { color: #f00; font-weight: bold; }
+        
+        #error-log { color: #f00; font-size: 10px; margin-top: 5px; display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="cesiumContainer"></div>
+
+    <div id="ui-panel">
+        <h1>[Final Strict Culling]</h1>
+        
+        <button class="btn" onclick="flyToTarget()">>> RESET VIEW (KOWLOON)</button>
+        <button class="btn" onclick="addBuildings()">>> SPAWN TEST OBSTACLES</button>
+        
+        <div class="stats-box">
+            <div>STATUS: <span id="sys-status" style="color:#0f0">RUNNING v3.0</span></div>
+            <div style="margin-top:5px; border-top:1px dashed #333; padding-top:5px;">METRICS:</div>
+            <div>Tiles Loaded: <span id="stat-loaded" class="highlight">0</span></div>
+            <div>Tiles Culled: <span id="stat-culled" class="red-text">0</span></div>
+            <div id="error-log"></div>
+        </div>
+    </div>
+
+    <script>
+        window.onload = function() {
+            try { initApp(); } catch (e) { console.error(e); }
+        };
+
+        let viewer;
+        let hkTileset;
+        let buildingEntities = [];
+        let culledCounter = 0; 
+
+        // 目标区域坐标 (九龙湾)
+        const minLon = 114.13097;
+        const maxLon = 114.14586;
+        const minLat = 22.33912;
+        const maxLat = 22.38504;
+        
+        // 预计算目标区域的弧度边界
+        const targetWest = Cesium.Math.toRadians(minLon);
+        const targetEast = Cesium.Math.toRadians(maxLon);
+        const targetSouth = Cesium.Math.toRadians(minLat);
+        const targetNorth = Cesium.Math.toRadians(maxLat);
+
+        async function initApp() {
+            // 1. 初始化 Viewer (极致性能模式)
+            viewer = new Cesium.Viewer('cesiumContainer', {
+                imageryProvider: false, baseLayerPicker: false, geocoder: false,
+                homeButton: false, infoBox: false, selectionIndicator: false,
+                timeline: false, animation: false, navigationHelpButton: false,
+                sceneModePicker: false, fullscreenButton: false, 
+                skyBox: false, skyAtmosphere: false,
+                contextOptions: { webgl: { alpha: false } }
+            });
+
+            viewer.scene.globe.show = false;
+            viewer.scene.backgroundColor = Cesium.Color.BLACK;
+            
+            // 2. 创建绿框
+            createFloatingBoundary();
+
+            // 3. 加载 3D Tiles
+            const tilesetUrl = "https://data.map.gov.hk/api/3d-data/3dtiles/f2/tileset.json?key=670fbb6714fc4deeaac60ddbb8823f61";
+            
+            try {
+                hkTileset = await Cesium.Cesium3DTileset.fromUrl(tilesetUrl, {
+                    maximumScreenSpaceError: 16, 
+                    skipLevelOfDetail: true,
+                    loadSiblings: false 
+                });
+                
+                // --- 终极修复：纯数学范围检测 (NO Cesium Geometry APIs) ---
+                hkTileset.tileVisible.addEventListener(function(tile) {
+                    if (!tile.boundingSphere) return;
+
+                    // 为了绝对避免报错，我们不调用任何复杂的 Cesium 函数
+                    // 只使用最基础的属性
+                    
+                    try {
+                        // 1. 获取缓存的检测数据，或重新计算
+                        // 使用 _strictBounds 避免与旧属性冲突
+                        if (!tile._strictBounds) {
+                            const center = tile.boundingSphere.center;
+                            const radius = tile.boundingSphere.radius;
+                            
+                            // 将笛卡尔坐标转为 Cartographic (弧度)
+                            const cart = Cesium.Cartographic.fromCartesian(center);
+                            
+                            if (!cart) {
+                                // 异常数据直接放行或隐藏，防止报错
+                                return; 
+                            }
+
+                            const R = 6378137.0; // 地球半径
+                            const radBuffer = (radius / R) * 1.05; // 5% 缓冲
+
+                            // 纯数值存储
+                            tile._strictBounds = {
+                                w: cart.longitude - radBuffer, // West
+                                e: cart.longitude + radBuffer, // East
+                                s: cart.latitude - radBuffer,  // South
+                                n: cart.latitude + radBuffer   // North
+                            };
+                        }
+
+                        const b = tile._strictBounds;
+
+                        // 2. 核心逻辑：分离轴检测 (Separating Axis Theorem 简化版)
+                        // 只要满足以下任一条件，即判定为“在框外”
+                        const isOutside = (
+                            b.e < targetWest ||  // 瓦片最东边 < 目标最西边 (在左侧)
+                            b.w > targetEast ||  // 瓦片最西边 > 目标最东边 (在右侧)
+                            b.n < targetSouth || // 瓦片最北边 < 目标最南边 (在下侧)
+                            b.s > targetNorth    // 瓦片最南边 > 目标最北边 (在上侧)
+                        );
+
+                        // 3. 强制剔除
+                        if (isOutside) {
+                            tile.visible = false;
+                            culledCounter++;
+                        }
+                    } catch (err) {
+                        // 绝对静默失败，保证不阻塞渲染循环
+                    }
+                });
+
+                viewer.scene.primitives.add(hkTileset);
+                flyToTarget(0);
+                setInterval(updateStats, 500);
+
+            } catch (error) {
+                console.error("加载错误:", error);
+                document.getElementById('sys-status').textContent = "ERROR";
+                document.getElementById('error-log').textContent = error.message;
+                document.getElementById('error-log').style.display = 'block';
+            }
+        }
+
+        // --- 辅助功能 ---
+
+        function updateStats() {
+            if (!hkTileset) return;
+            const loaded = hkTileset.statistics.numberOfTilesWithContentReady;
+            document.getElementById('stat-loaded').textContent = loaded;
+            
+            // 视觉反馈：剔除计数器
+            const culledEl = document.getElementById('stat-culled');
+            culledEl.textContent = culledCounter;
+            
+            if (culledCounter > 0) {
+                culledEl.style.color = '#f00';
+                culledEl.style.textShadow = '0 0 5px red';
+            } else {
+                culledEl.style.color = '#555';
+                culledEl.style.textShadow = 'none';
+            }
+            culledCounter = 0;
+        }
+
+        function createFloatingBoundary() {
+            const h = 400; const low = -200;
+            const pos = Cesium.Cartesian3.fromDegreesArrayHeights([
+                minLon, maxLat, h, maxLon, maxLat, h,
+                maxLon, minLat, h, minLon, minLat, h,
+                minLon, maxLat, h
+            ]);
+            viewer.entities.add({
+                polyline: { positions: pos, width: 2, material: Cesium.Color.LIME }
+            });
+        }
+
+        window.flyToTarget = function(duration = 1.0) {
+            const centerLon = (minLon + maxLon) / 2;
+            const centerLat = (minLat + maxLat) / 2;
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, 3000), 
+                orientation: { heading: 0, pitch: Cesium.Math.toRadians(-60), roll: 0 },
+                duration: duration
+            });
+        }
+
+        window.addBuildings = function() {
+            if (!viewer) return;
+            buildingEntities.forEach(b => viewer.entities.remove(b));
+            buildingEntities = [];
+            for (let i = 0; i < 10; i++) {
+                const lon = minLon + Math.random() * (maxLon - minLon);
+                const lat = minLat + Math.random() * (maxLat - minLat);
+                buildingEntities.push(viewer.entities.add({
+                    position: Cesium.Cartesian3.fromDegrees(lon, lat, 100),
+                    box: { dimensions: new Cesium.Cartesian3(40, 40, 200), material: Cesium.Color.RED.withAlpha(0.5), outline: true, outlineColor: Cesium.Color.RED }
+                }));
+            }
+        }
+    </script>
+</body>
+</html>
